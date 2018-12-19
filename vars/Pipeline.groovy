@@ -16,7 +16,6 @@
  * under the License.
  */
 
-
 import org.wso2.tg.jenkins.Logger
 import org.wso2.tg.jenkins.PipelineContext
 import org.wso2.tg.jenkins.alert.Slack
@@ -28,7 +27,7 @@ import org.wso2.tg.jenkins.Properties
 import org.wso2.tg.jenkins.util.Common
 import org.wso2.tg.jenkins.util.RuntimeUtils
 import org.wso2.tg.jenkins.util.WorkSpaceUtils
-
+import org.wso2.tg.jenkins.util.ConfigUtils
 
 // The pipeline should reside in a call block
 def call() {
@@ -48,6 +47,7 @@ def call() {
     def ws = new WorkSpaceUtils()
     def common = new Common()
     def log = new Logger()
+    def config = new ConfigUtils()
 
     pipeline {
         agent {
@@ -72,6 +72,7 @@ def call() {
             stage('Preparation') {
                 steps {
                     script {
+                        currentBuild.result = "SUCCESS"
                         try {
                             alert.sendNotification('STARTED', "Initiation", "#build_status_verbose")
                             alert.sendNotification('STARTED', "Initiation", "#build_status")
@@ -82,9 +83,12 @@ def call() {
                             // Get testgrid.yaml from jenkins managed files
                             if (props.TESTGRID_YAML_URL != null) {
                                 log.info("testgrid.yaml is retrieved from ${props.TESTGRID_YAML_URL}")
-                                sh """
-                                    curl -k -o ${props.WORKSPACE}/${props.TESTGRID_YAML_LOCATION} ${props.TESTGRID_YAML_URL}
-                                """
+                                withCredentials([string(credentialsId: "GIT_WUM_USERNAME", variable: 'user'),
+                                                 string(credentialsId: "GIT_WUM_PASSWORD", variable: 'pass')]) {
+                                    sh """
+                                        curl --user $user:$pass -k -o ${props.WORKSPACE}/${props.TESTGRID_YAML_LOCATION} ${props.TESTGRID_YAML_URL}
+                                    """
+                                }
                             } else {
                                 sh """
                                 git clone ${props.TESTGRID_JOB_CONFIG_REPOSITORY}
@@ -123,9 +127,23 @@ def call() {
                             sh """
                                 echo The job-config.yaml content :
                                 cat ${props.JOB_CONFIG_YAML_PATH}
+                               
                             """
+                            configFileProvider(
+                                    [configFile(fileId: "common-configs", targetLocation:
+                                            "${props.WORKSPACE}/common-configs.properties")]) {
+                            }
+
+                            def commonConfigs = readProperties file:"${props.WORKSPACE}/common-configs.properties"
+                            tgYamlContent = config.addCommonConfigsToTestGridYaml(tgYamlContent,commonConfigs)
+
+                            //remove the existing testgrid yaml file before creating the new one
+                            sh " rm ${props.WORKSPACE}/${props.TESTGRID_YAML_LOCATION}"
+                            //write the new testgrid yaml file after adding new config values
+                            writeYaml file: "${props.WORKSPACE}/${props.TESTGRID_YAML_LOCATION}", data: tgYamlContent
 
                             log.info("Generating test plans for the product : " + props.PRODUCT)
+
                             tgExecutor.generateTesPlans(props.PRODUCT, props.JOB_CONFIG_YAML_PATH)
 
                             log.info("Stashing test plans to be used in different slave nodes")
@@ -133,7 +151,8 @@ def call() {
                                 stash name: "test-plans", includes: "test-plans/**"
                             }
                         } catch (e) {
-                            currentBuild.result = "FAILED"
+                            currentBuild.result = "FAILURE"
+                            echo e.toString()
                         } finally {
                             alert.sendNotification(currentBuild.result, "preparation", "#build_status_verbose")
                         }
@@ -150,7 +169,7 @@ def call() {
                             def tests = testExecutor.getTestExecutionMap(props.EXECUTOR_COUNT)
                             parallel tests
                         } catch (e) {
-                            currentBuild.result = "FAILED"
+                            currentBuild.result = "FAILURE"
                             alert.sendNotification(currentBuild.result, "Parallel", "#build_status_verbose")
                         }
                     }
@@ -165,10 +184,13 @@ def call() {
                         tgExecutor.finalizeTestPlans(props.PRODUCT, props.WORKSPACE)
                         tgExecutor.generateEmail(props.PRODUCT, props.WORKSPACE)
                         awsHelper.uploadCharts()
+                        def configUtil = new ConfigUtils()
                         //Send email for failed results.
                         if (fileExists("${props.WORKSPACE}/SummarizedEmailReport.html")) {
                             def emailBody = readFile "${props.WORKSPACE}/SummarizedEmailReport.html"
-                            email.send("'${props.PRODUCT}' Test Results! #(${env.BUILD_NUMBER})",
+                            def environment = configUtil.getPropertyFromTestgridConfig("TESTGRID_ENVIRONMENT").toUpperCase()
+                            email.send(
+                                    "[${environment}][${currentBuild.result}] '${props.PRODUCT}' Test Results!" + " #(${env.BUILD_NUMBER})",
                                     "${emailBody}")
                         } else {
                             log.warn("No SummarizedEmailReport.html file found!!")
@@ -177,11 +199,12 @@ def call() {
                                     "testgrid.")
                         }
                     } catch (e) {
-                        currentBuild.result = "FAILED"
+                        currentBuild.result = "FAILURE"
                     } finally {
                         alert.sendNotification(currentBuild.result, "completed", "#build_status")
                         alert.sendNotification(currentBuild.result, "completed", "#build_status_verbose")
                     }
+
                 }
             }
         }
